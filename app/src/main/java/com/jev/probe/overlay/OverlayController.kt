@@ -58,6 +58,10 @@ class OverlayController(private val ctx: Context) {
     private var lastJudgment: Analysis? = null
     private var lastFill: ((String) -> Unit)? = null
 
+    /** Which analysis instance is already laid out, so idle refreshes don't rebuild it. */
+    private var renderedAnalysis: Analysis? = null
+    private var idleButtonShown = false
+
     private fun dp(v: Int) = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), ctx.resources.displayMetrics).roundToInt()
 
@@ -276,17 +280,28 @@ class OverlayController(private val ctx: Context) {
         renderedTitle = title
         lastJudgment = null
         lastFill = null
+        renderedAnalysis = null
         dangerDot?.background = GradientDrawable().apply {
             shape = GradientDrawable.OVAL; setColor(Color.TRANSPARENT)
         }
-        if (root != null) setContent(listOf(bigButton("分析当前对话") { onManualAnalyze?.invoke() }))
+        if (root != null) {
+            setContent(listOf(bigButton("分析当前对话") { onManualAnalyze?.invoke() }))
+            idleButtonShown = true
+        }
     }
 
     fun showIdle() {
         ensureRoot()
         val a = lastJudgment
-        if (a == null) setContent(listOf(bigButton("分析当前对话") { onManualAnalyze?.invoke() }))
-        else render(a, generating = a.rankedReplies.isEmpty(), autoExpand = false)
+        if (a == null) {
+            // Only build the button once; idle fires on every content-changed event.
+            if (!idleButtonShown) {
+                setContent(listOf(bigButton("分析当前对话") { onManualAnalyze?.invoke() }))
+                idleButtonShown = true
+            }
+        } else if (renderedAnalysis !== a) {
+            render(a, generating = a.rankedReplies.isEmpty(), autoExpand = false)
+        }
         bubble?.alpha = 0.55f
     }
 
@@ -331,6 +346,10 @@ class OverlayController(private val ctx: Context) {
         val r = root ?: return
         runCatching { wm.removeView(r) }
         root = null; bubble = null; panel = null; contentBox = null; dangerDot = null; expanded = false
+        // Content is gone with the window; force a rebuild next time it is shown,
+        // but keep lastJudgment/renderedTitle so the same chat is not re-analyzed.
+        renderedAnalysis = null
+        idleButtonShown = false
     }
 
     // --------------------------------------------------------------- rendering
@@ -378,6 +397,8 @@ class OverlayController(private val ctx: Context) {
         views.add(reAnalyzeBtn())
 
         setContent(views)
+        renderedAnalysis = a
+        idleButtonShown = false
         if (autoExpand && !expanded) toggle()
     }
 

@@ -40,7 +40,9 @@ open class WeChatCaptureService : AccessibilityService() {
 
     private var lastSignature: String = ""
     private var analyzing = false
+    private var capturing = false
     private val debounce = Runnable { runAnalysis() }
+    private val captureDebounce = Runnable { maybeCapture() }
     private var pendingSnapshot: ChatSnapshot? = null
     @Volatile private var currentSnapshot: ChatSnapshot? = null
     private var foregroundPkg: String? = null
@@ -83,19 +85,49 @@ open class WeChatCaptureService : AccessibilityService() {
             }
         }
 
+        // Coalesce bursts (IME, list redraws, scrolling) before the — now
+        // off-thread — tree walk, so a flood of content-changed events can no
+        // longer pile heavy work onto the main thread and stall the overlay.
         when (type) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> scheduleCapture(100)
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
-            AccessibilityEvent.TYPE_VIEW_SCROLLED -> maybeCapture()
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> scheduleCapture(200)
         }
     }
 
+    /** Drop the previous pending capture and schedule a fresh one. */
+    private fun scheduleCapture(delayMs: Long) {
+        main.removeCallbacks(captureDebounce)
+        main.postDelayed(captureDebounce, delayMs)
+    }
+
+    /**
+     * Fetch the active window on the main thread, then walk its node tree on a
+     * worker. The walk visits thousands of nodes and used to run inline on the
+     * main thread, which blocked the overlay's touch handling and made opening
+     * the panel feel like it took "forever". Only one walk is ever in flight.
+     */
     private fun maybeCapture() {
+        if (capturing) return
         val root = rootInActiveWindow ?: return
+        capturing = true
+        submit {
+            val snapshot = try { extractSnapshot(root) } catch (e: Exception) {
+                Log.w(TAG, "extract failed: ${e.message}"); null
+            }
+            main.post {
+                capturing = false
+                handleSnapshot(snapshot)
+            }
+        }
+    }
+
+    /** Runs on the main thread once the off-thread walk finished. */
+    private fun handleSnapshot(snapshot: ChatSnapshot?) {
+        if (!prefs.enabled) return
         // Only act inside a chat window (has message bubbles).
-        val snapshot = extractSnapshot(root) ?: return
-        if (snapshot.messages.isEmpty()) return
-        if (!prefs.isAllowed(snapshot.title)) { main.post { overlay?.hide() }; return }
+        if (snapshot == null || snapshot.messages.isEmpty()) return
+        if (!prefs.isAllowed(snapshot.title)) { overlay?.hide(); return }
 
         currentSnapshot = snapshot
         // Switching chats must drop the previous conversation's judgment.
@@ -106,13 +138,13 @@ open class WeChatCaptureService : AccessibilityService() {
         if (sig == lastSignature && showing) return
         // Same content but the bubble is gone (killed by MIUI, or we left and came
         // back) → just put the bubble back, do NOT re-analyze (saves tokens/time).
-        if (sig == lastSignature && !showing) { main.post { overlay?.showIdle() }; return }
+        if (sig == lastSignature && !showing) { overlay?.showIdle(); return }
         lastSignature = sig
 
         // Trigger only when the newest message is from the other person, and only
         // if auto-analyze is on. Otherwise show the idle bubble (tap to analyze).
         if (snapshot.latestFrom != "other" || !prefs.autoAnalyze) {
-            main.post { overlay?.showIdle() }; return
+            overlay?.showIdle(); return
         }
 
         pendingSnapshot = snapshot
@@ -123,7 +155,7 @@ open class WeChatCaptureService : AccessibilityService() {
     private fun runAnalysis() {
         val snapshot = pendingSnapshot ?: return
         if (analyzing) return
-        if (!prefs.hasKey()) { main.post { overlay?.showError("未设置 OpenRouter 密钥，去设置里填") }; return }
+        if (!prefs.hasKey()) { main.post { overlay?.showError("未设置判断接口密钥，去设置里填") }; return }
         analyzing = true
         main.post { overlay?.showLoading() }
         val client = JevClient(prefs)
